@@ -1,0 +1,8 @@
+# To load .env files
+python-dotenv
+
+# For making HTTP requests (used in Telegram logic)
+requests
+
+# Google Gemini AI SDK (Required for the agents)
+google-generativeai
