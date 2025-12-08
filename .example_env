@@ -1,0 +1,11 @@
+####
+
+                                
+###TELEGRAM_BOT_TOKEN = telegram bot toke
+
+###TELEGRAM_CHAT_ID= the id of the chat that will get the notifications
+
+###GEMINI_API_KEY
+
+###PROJECT_PATH = path to the project you want to run
+###EXECUTE_COMMAND = the exectute command of how you usually run your code
