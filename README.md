@@ -181,4 +181,5 @@ I'd love to hear your feedback! Whether you have questions about the architectur
 * 💼 **LinkedIn**: [Ran Wurmbrand](https://www.linkedin.com/in/ranwurmbrand/)
 * 🐙 **GitHub**: [@RanWurmbrand](https://github.com/RanWurmbrand/) or [@RanWurm](https://github.com/RanWurm)
 * 🌐 **Website**: [My Portfolio](https://ran-wurmbrand.vercel.app/)
+
 Don't hesitate to open an issue if you encounter bugs!
