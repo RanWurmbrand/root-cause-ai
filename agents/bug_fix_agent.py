@@ -205,6 +205,8 @@ class BugFixAgent:
         print(f"[bug-fix-agent] Using latest hint: {latest_hint}")
 
         tool_outputs: Dict[str, str] = {}
+        file_read_count = 0  # ← הוסף מונה
+        MAX_FILE_READS = 1   
 
         for step in range(1, 8):  # up to 7 steps
             ctx_str = json.dumps(tool_outputs, ensure_ascii=False, indent=2)[:20000]
@@ -261,6 +263,12 @@ class BugFixAgent:
                 continue
 
             if action == "read_file":
+                if file_read_count >= MAX_FILE_READS:
+                        print(f"[agent] ⚠ read_file limit reached ({MAX_FILE_READS}), skipping")
+                        tool_outputs["FILE_READ_LIMIT"] = "Limit reached. Use extract_function instead."
+                        continue
+
+                file_read_count += 1
                 params = msg.get("params") or {}
                 file_path = params.get("file_path")
 

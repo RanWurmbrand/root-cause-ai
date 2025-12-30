@@ -1,13 +1,22 @@
-from core.rootcause_controller import ProjectRunner
-if __name__ == "__main__":
-    import sys
+from core.rootcause_controller import RootCauseController
+from dotenv import load_dotenv
+import os
 
-    if len(sys.argv) < 2:
-        print("Usage: python project_runner.py /path/to/project [command]")
+load_dotenv()
+
+if __name__ == "__main__":
+    PROJECT_PATH = os.getenv("PROJECT_PATH")
+    EXECUTE_COMMAND = os.getenv("EXECUTE_COMMAND", "npm test")
+
+    if not PROJECT_PATH:
+        print("Error: PROJECT_PATH not set in .env file")
+        print("Please create a .env file with:")
+        print("  PROJECT_PATH=/path/to/your/project")
+        print("  EXECUTE_COMMAND=npx vitest")
+        print("  GEMINI_API_KEY=your_key")
+        print("  TELEGRAM_BOT_TOKEN=your_token")
+        print("  TELEGRAM_CHAT_ID=your_chat_id")
         exit(1)
 
-    project_path = sys.argv[1]
-    command = sys.argv[2] if len(sys.argv) > 2 else "npm test"
-
-    runner = ProjectRunner(project_path, command)
-    runner.run()
+    controller = RootCauseController(PROJECT_PATH, EXECUTE_COMMAND)
+    controller.start()
