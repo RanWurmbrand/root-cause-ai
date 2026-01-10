@@ -7,6 +7,8 @@ An intelligent debugging assistant that automatically detects, analyzes, and sug
 - **Automated Test Execution**: Runs your project tests and captures detailed logs
 - **AI-Powered Root Cause Analysis**: Uses Google's Gemini AI to analyze test failures and identify root causes
 - **Intelligent Bug Fix Suggestions**: Agentic system that explores your codebase and proposes minimal, targeted fixes
+- **Automated Fix Application**: Automatically applies suggested patches to your codebase with Git version control
+- **Safe Git Branching**: All fixes are committed to a separate `rootcause-fixes` branch, preserving your main branch
 - **Interactive Telegram Notifications**: Get real-time updates with actionable options directly in Telegram
 - **Minimal Context Usage**: Smart tool selection to reduce token consumption and API costs
 
@@ -14,6 +16,7 @@ An intelligent debugging assistant that automatically detects, analyzes, and sug
 
 - Python 3.8+
 - Node.js project (currently supports `npm test` command)
+- **Git repository** (required for Fix & Rerun feature)
 - Google Gemini API key
 - Telegram bot token and chat ID
 
@@ -63,7 +66,15 @@ EXECUTE_COMMAND=npm test
    - Start a chat with it and it will display your Chat ID
    - Copy the ID to `TELEGRAM_CHAT_ID`
 
-### 4. Run the Controller
+### 4. Initialize Git in Your Project (Required for Fix & Rerun)
+```bash
+cd /path/to/your/project
+git init  # If not already a git repository
+git add .
+git commit -m "Initial commit"
+```
+
+### 5. Run the Controller
 ```bash
 python -m core.rootcause_controller
 ```
@@ -73,8 +84,8 @@ The system will:
 2. Analyze any failures
 3. Generate fix suggestions
 4. Send you a Telegram message with three options:
-   - 🔁 **Rerun**: Run tests again
-   - 🛠️ **Fix & Rerun**: Apply the suggested fix and rerun (coming soon)
+   - 🔄 **Rerun**: Run tests again
+   - 🛠️ **Fix & Rerun**: Apply the suggested fix, commit to Git, and rerun tests
    - ⛔ **Terminate**: Stop the debugging cycle
 
 ## 📁 Project Structure
@@ -85,7 +96,9 @@ root-cause-ai/
 │   └── bug_fix_agent.py        # Suggests targeted bug fixes
 ├── core/
 │   ├── project_runner.py       # Executes project tests
-│   └── rootcause_controller.py # Orchestrates the debugging workflow
+│   ├── rootcause_controller.py # Orchestrates the debugging workflow
+│   ├── git_manager.py          # Manages Git branching and commits
+│   └── code_applier.py         # Applies patches to codebase
 ├── messaging/
 │   ├── bugfix_notifier.py      # Formats bug fix messages
 │   └── telegram_manager.py     # Handles Telegram interactions
@@ -109,7 +122,12 @@ root-cause-ai/
    - Extracts relevant code
    - Generates a minimal patch suggestion
 4. **User Notification**: Results are sent to Telegram with actionable buttons
-5. **Loop or Terminate**: Based on your choice, the system reruns or stops
+5. **Fix Application** (if "Fix & Rerun" selected):
+   - `git_manager.py` creates/switches to `rootcause-fixes` branch (first time only)
+   - `code_applier.py` parses the unified diff and applies the patch
+   - Changes are automatically committed with a descriptive message
+   - Tests are re-run to validate the fix
+6. **Loop or Terminate**: Based on your choice, the system continues or stops
 
 ## 🎯 Key Components
 
@@ -123,6 +141,18 @@ root-cause-ai/
 - Requests only the context it needs (minimizing token usage)
 - Produces unified diff patches for targeted fixes
 
+### Git Manager
+- Creates separate `rootcause-fixes` branch on first fix
+- Preserves main branch integrity
+- Auto-commits with descriptive messages
+- Supports incremental fixes with full version history
+
+### Code Applier
+- Parses unified diff format patches
+- Locates and replaces code intelligently
+- Validates patch application success
+- Handles fuzzy matching for code changes
+
 ### Telegram Integration
 - Real-time notifications with HTML formatting
 - Interactive buttons for workflow control
@@ -133,36 +163,39 @@ root-cause-ai/
 I'd love your help! Here are areas where contributions would be especially valuable:
 
 ### High Priority
-- **Implement Auto-Fix**: Complete the "Fix & Rerun" button functionality to automatically apply suggested patches
 - **Token Optimization**: Further reduce Gemini API token consumption through:
   - Smarter context selection
   - More efficient prompts
   - Caching strategies
 - **Multi-Language Support**: Extend beyond Node.js to support Python pytest, Java JUnit, etc.
+- **Enhanced Patch Matching**: Improve fuzzy matching for code that has changed since fix generation
 
 ### Medium Priority
 - **Enhanced Fix Validation**: Add confidence scoring for fix suggestions
-- **Patch Preview**: Show before/after diffs more clearly
+- **Patch Preview**: Show before/after diffs more clearly in Telegram
 - **Configuration UI**: Web interface for easier setup
 - **Cost Tracking**: Monitor and report API usage costs
+- **Rollback Support**: Automatically rollback if tests fail after applying fix
 
 ### Nice to Have
 - **CI/CD Integration**: GitHub Actions / GitLab CI support
-- **Multiple LLM Support**: Add OpenAI, Anthropic Claude options
+- **Multiple LLM Support**: Add OpenAI, Anthropic Claude, Grok options
 - **Historical Analysis**: Track fix success rates over time
+- **Web Dashboard**: Visualize debugging sessions and fix history
 
 Feel free to open issues or submit PRs for any improvements!
 
-## 📝 License
+## 📄 License
 
 MIT License - feel free to use this project however you'd like!
 
-## 🐛 Known Limitations
+## 🛠 Known Limitations
 
 - Currently only supports Node.js projects with `npm test`
-- Requires manual application of suggested fixes
 - Limited to text-based analysis (no screenshot/visual debugging)
 - Gemini API rate limits may affect rapid iterations
+- Fix application requires exact or near-exact code matching
+- Git repository required for automated fix application
 
 ## 💡 Tips
 
@@ -170,6 +203,8 @@ MIT License - feel free to use this project however you'd like!
 - Check `artifacts/` folders for detailed outputs if something goes wrong
 - The system works best with clear, descriptive test failure messages
 - Consider setting up API spending limits on your Google Cloud account
+- Review fixes in the `rootcause-fixes` branch before merging to main
+- Use `git diff main..rootcause-fixes` to see all applied fixes
 
 ---
 
@@ -179,7 +214,7 @@ I'd love to hear your feedback! Whether you have questions about the architectur
 
 * 📧 **Email**: [ranwurembrand@gmail.com](mailto:ranwurembrand@gmail.com) or [rwurmbra@redhat.com](mailto:rwurmbra@redhat.com)
 * 💼 **LinkedIn**: [Ran Wurmbrand](https://www.linkedin.com/in/ranwurmbrand/)
-* 🐙 **GitHub**: [@RanWurmbrand](https://github.com/RanWurmbrand/) or [@RanWurm](https://github.com/RanWurm)
+* 🙂 **GitHub**: [@RanWurmbrand](https://github.com/RanWurmbrand/) or [@RanWurm](https://github.com/RanWurm)
 * 🌐 **Website**: [My Portfolio](https://ran-wurmbrand.vercel.app/)
 
 Don't hesitate to open an issue if you encounter bugs!
