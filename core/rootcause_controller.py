@@ -11,15 +11,21 @@ from dotenv import load_dotenv
 import os
 from pathlib import Path
 load_dotenv()
+from messaging.telegram_manager import TelegramManager
+
 ROOT = Path(__file__).resolve().parents[1]
 
 class RootCauseController:
+   
     def __init__(self, project_path: str, command: str = "npm test"):
         self.project_path = project_path
         self.command = command
+        self.total_tokens = 0
         self.git_manager = None
         self.code_applier = None
-        self.flag= False
+        self.user_suggestion = ""
+        self.run_without_user_suggestion = True
+        self.MAX_TOKENS_PER_SESSION = 13_000_000 
         try:
             self.git_manager = GitManager(self.project_path)
             print("[controller] ✓ Git repository detected")
@@ -68,33 +74,45 @@ class RootCauseController:
 
     def run_once(self):
         # 1. Run project tests
-        if self.flag:
-            runner = ProjectRunner(self.project_path, self.command)
-            runner.run()
+        try:
+            if self.run_without_user_suggestion:
+                runner = ProjectRunner(self.project_path, self.command)
+                log_file, exit_code, output_log = runner.run()
+                self.output_log = output_log
 
-        # 2. Run AI trace agent (creates latest hint)
-        trace_agent = AiTraceAgent()
-        trace_agent.run()
+                # 2. Run AI trace agent (creates latest hint)
+                trace_agent = AiTraceAgent()
+                self.total_tokens += trace_agent.run()
 
-        # 3. Run AI bug fix agent (creates latest fix)
-        fix_agent = BugFixAgent(self.project_path)
-        fix_agent.run()
+            # 3. Run AI bug fix agent (creates latest fix)
+            fix_agent = BugFixAgent(self.project_path,self.user_suggestion)
+            self.total_tokens += fix_agent.run()
 
-        # 4. Build message
-        builder = BugFixMessageBuilder()
-        message = builder.build_message()
+            # 4. Build message
+            builder = BugFixMessageBuilder()
+            message, is_long = builder.build_message()
 
-        # 5. Send to Telegram and wait for user action
-        tm = TelegramManager()
-        tm.send_bugfix_message(message)
-        user_choice = tm.wait_for_user_response()
+            # 5. Send to Telegram and wait for user action
+            tm = TelegramManager()
+            if is_long:
+                tm.send_document(message, "bugfix_summary.html", "🚨 Bug Fix Summary (see attached file)")
+                tm.send_bugfix_message("📎 Full report sent as file. Choose action:")
+            else:
+                tm.send_bugfix_message(message)
+            user_choice = tm.wait_for_user_response()
 
-        return user_choice
-
+            return user_choice
+        except Exception as e:
+                tm = TelegramManager()
+                tm.send_message(f"❌ <b>Agent Error</b>\n\n<code>{type(e).__name__}: {str(e)[:500]}</code>")
+                raise
     def start(self):
         while True:
+            
             action = self.run_once()
-
+            self.run_without_user_suggestion = True
+            self.user_suggestion = ""
+            
             if action == "rerun":
                 print("[controller] User selected RERUN → starting again...")
                 continue
@@ -109,11 +127,23 @@ class RootCauseController:
                 else:
                     print("[controller] ✗ Fix application failed")
                     print("[controller] → Re-running tests anyway to see current state...\n")
+            
+            elif action == "suggest":
+                self.run_without_user_suggestion = False
+                print("[controller] User wants to suggest - waiting for input...")
+                tm = TelegramManager()
+                tm.send_message("Please send your suggestion:")
+                self.user_suggestion = tm.wait_for_text_message()
+                print(f"[controller] Got suggestion: {self.user_suggestion}")
 
             elif action == "terminate":
                 print("[controller] Terminate requested → stopping.")
                 break
-
+            
+            if self.total_tokens >= self.MAX_TOKENS_PER_SESSION:
+                print(f"[controller] ⚠ Token limit reached ({self.total_tokens}), Ending Session")
+                break
+            
 
 if __name__ == "__main__":
     PROJECT_PATH = os.getenv("PROJECT_PATH")

@@ -37,26 +37,34 @@ class BugFixMessageBuilder:
         return path, data
 
     def build_message(self) -> str:
-        # helper: split unified diff into "before" / "after"
-        def split_patch(raw: str) -> tuple[str, str]:
-            before_lines = []
-            after_lines = []
-            for line in raw.splitlines():
-                # ignore metadata / headers
-                if line.startswith(("diff ", "index ", "@@", "---", "+++")):
-                    continue
-                if line.startswith("+"):
-                    after_lines.append(line[1:])
-                elif line.startswith("-"):
-                    before_lines.append(line[1:])
-            before = "\n".join(before_lines).strip()
-            after = "\n".join(after_lines).strip()
-            return before, after
-
         # Extract values
         hint_path, hint_data = self.load_latest_hint()
         fix_path, fix_data = self.load_latest_fix()
-
+        if fix_data.get("type") == "partial_analysis":
+            context_list = fix_data.get("context_gathered", [])
+            reason = fix_data.get("reason", "")
+            
+            msg = (
+                "<b>⚠️ Partial Analysis</b>\n\n"
+                f"<b>🧩 Hint:</b>\n{escape(str(hint_data.get('cause', 'Unknown')))}\n\n"
+                f"<b>❓ Status:</b>\n{escape(reason)}\n\n"
+                f"<b>📂 Context gathered:</b>\n"
+            )
+            for ctx in context_list[:5]:
+                msg += f"• <code>{escape(ctx[:100])}</code>\n"
+            
+            msg += "\n<i>The agent couldn't complete the analysis. You can try 'Suggest' to guide it.</i>"
+            return msg, len(msg) > 4000
+        
+        if fix_data.get("type") == "analysis":
+            analysis_text = fix_data.get("text", "")
+            msg = (
+                "<b>🔍 AI Analysis</b>\n\n"
+                f"<b>🧩 Hint:</b>\n{escape(str(hint_data.get('cause', 'Unknown')))}\n\n"
+                f"<b>📝 Analysis:</b>\n{escape(analysis_text[:2000])}\n\n"
+                "<i>The AI could not provide a specific fix, but shared this analysis.</i>"
+            )
+            return msg, len(msg) > 4000
         hint_first_line = str(hint_data.get("cause", "Unknown")).split("\n")[0]
         reason = fix_data.get("reason", "No reason provided.")
         functions = fix_data.get("functions_to_edit", [])
@@ -103,7 +111,8 @@ class BugFixMessageBuilder:
             f"<b>Suggested fix:</b>\n<pre>{suggested_block}</pre>\n\n"
         )
 
-        return msg
+        is_long = len(msg) > 4000
+        return msg, is_long
 
     
 def main():

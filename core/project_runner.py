@@ -2,17 +2,53 @@
 import subprocess
 import time
 from pathlib import Path
+import os
 ROOT = Path(__file__).resolve().parents[1]
 class ProjectRunner:
     def __init__(self, project_path: str, command: str = "npm test"):
         self.project_path = Path(project_path).resolve()
         self.command = command
-        self.logs_dir = ROOT / "artifacts" /  "rootcause_logs"
+        self.logs_dir = ROOT / "artifacts" / "rootcause_logs"
         self.logs_dir.mkdir(exist_ok=True)
+        
+        self.output_logs_dir = ROOT / "artifacts" / "output_logs"
+        self.output_logs_dir.mkdir(exist_ok=True)
+        
+        self.collect_output = os.getenv("COLLECT_OUTPUT_LOGS", "").lower() == "true"
+        self.output_log_name = os.getenv("OUTPUT_LOG_NAME", "")
 
         if not self.project_path.is_dir():
             raise ValueError(f"Invalid project path: {self.project_path}")
+    def _find_latest_output_log(self) -> Path | None:
+        """ looks for latest output logs with matching name"""
+        if not self.output_log_name:
+            return None
+        
+        matching_files = []
+        for log_file in self.project_path.rglob("*.log"):
+            if self.output_log_name in log_file.name:
+                matching_files.append(log_file)
+        
+        if not matching_files:
+            return None
+        
+        return max(matching_files, key=lambda p: p.stat().st_mtime)
+    
+    def _collect_output_log(self, timestamp: str) -> Path | None:
+        """collect out put logs and keep them on seprate folder"""
+        latest = self._find_latest_output_log()
+        if not latest:
+            print(f"[runner] Output log not found: {self.output_log_name}")
+            return None
+        
+        dest = self.output_logs_dir / f"output_{timestamp}.log"
+        content = latest.read_text(encoding="utf-8", errors="ignore")
+        dest.write_text(content, encoding="utf-8")
+        
+        print(f"[runner] Collected output log: {latest.name} -> {dest}")
+        return dest
 
+    
     def run(self) -> Path:
         timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
         log_file = self.logs_dir / f"run_{timestamp}.log"
@@ -35,7 +71,11 @@ class ProjectRunner:
         print(f"[runner] Done. Exit code: {process.returncode}")
         print(f"[runner] Log saved to: {log_file}")
 
-        return log_file
+        output_log = None
+        if self.collect_output:
+            output_log = self._collect_output_log(timestamp)
+
+        return log_file, process.returncode, output_log
 
 
 if __name__ == "__main__":

@@ -15,10 +15,18 @@ class GitManager:
         if not self.project_path.is_dir():
             raise ValueError(f"Invalid project path: {self.project_path}")
         
-        # Check if it's a git repository
-        if not (self.project_path / ".git").exists():
+        # Check if it's a git repository (search upward)
+        self.git_root = self._find_git_root()
+        if not self.git_root:
             raise RuntimeError(f"Not a git repository: {self.project_path}")
     
+    def _find_git_root(self) -> Path | None:
+        current = self.project_path
+        while current != current.parent:
+            if (current / ".git").exists():
+                return current
+            current = current.parent
+        return None  
     def _run_git_command(self, *args) -> tuple[bool, str]:
         """
         Run a git command in the project directory
