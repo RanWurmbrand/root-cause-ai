@@ -5,6 +5,7 @@ import json
 import re
 from pathlib import Path
 from typing import List, Tuple, Optional
+import subprocess
 
 
 class CodeApplier:
@@ -30,147 +31,191 @@ class CodeApplier:
         fix_path = fixes[0]
         fix_data = json.loads(fix_path.read_text(encoding="utf-8"))
         return fix_path, fix_data
-    
-    def _parse_unified_diff(self, patch: str) -> Tuple[List[str], List[str]]:
-        """
-        Parse unified diff format into removed lines and added lines
-        Returns: (lines_to_remove, lines_to_add)
-        """
-        removed = []
-        added = []
+
+    def _resolve_file_path(self, file_path: str) -> Path:
+        fpath = Path(file_path)
         
-        for line in patch.splitlines():
-            # Skip metadata lines
+        if fpath.is_absolute() and fpath.exists():
+            return fpath
+        
+        direct = (self.project_path / fpath).resolve()
+        if direct.exists():
+            return direct
+        
+        filename = fpath.name
+        parent = fpath.parent.name if fpath.parent.name else None
+        
+        for found in self.project_path.rglob(filename):
+            if parent is None or found.parent.name == parent:
+                return found
+        
+        return direct
+
+    def _parse_patch(self, raw_patch: str) -> List[Tuple[List[str], List[str]]]:
+        """
+        Parse patch into list of (old_lines, new_lines) hunks.
+        Groups consecutive -/+ lines together.
+        """
+        # Clean up
+        raw_patch = raw_patch.replace("```diff", "").replace("```", "").strip()
+        lines = raw_patch.splitlines()
+        
+        hunks = []
+        current_old = []
+        current_new = []
+        
+        for line in lines:
+            # Skip diff headers
             if line.startswith(("diff ", "index ", "@@", "---", "+++")):
                 continue
             
-            if line.startswith("+"):
-                added.append(line[1:])  # Remove the '+' prefix
-            elif line.startswith("-"):
-                removed.append(line[1:])  # Remove the '-' prefix
+            if line.startswith("-"):
+                # If we had new lines without old, save that hunk first
+                if current_new and not current_old:
+                    hunks.append((current_old[:], current_new[:]))
+                    current_old = []
+                    current_new = []
+                current_old.append(line[1:])
+            elif line.startswith("+"):
+                current_new.append(line[1:])
             else:
-                # Context lines (unchanged) appear in both
-                removed.append(line)
-                added.append(line)
+                # Context line or end of hunk - save current hunk if exists
+                if current_old or current_new:
+                    hunks.append((current_old[:], current_new[:]))
+                    current_old = []
+                    current_new = []
         
-        return removed, added
-    
-    def _find_and_replace_in_file(self, file_path: Path, old_lines: List[str], new_lines: List[str]) -> bool:
+        # Don't forget last hunk
+        if current_old or current_new:
+            hunks.append((current_old, current_new))
+        
+        return hunks
+
+    def _normalize(self, text: str) -> str:
+        """Normalize whitespace for comparison"""
+        return " ".join(text.split())
+
+    def _find_and_replace(self, content: str, old_lines: List[str], new_lines: List[str]) -> Tuple[bool, str]:
         """
-        Find the old code block in the file and replace it with new code
-        Returns True if successful, False otherwise
+        Find old_lines block in content and replace with new_lines.
+        Returns (success, new_content)
         """
-        if not file_path.exists():
-            print(f"[applier] File not found: {file_path}")
-            return False
+        if not old_lines:
+            # Pure addition - can't handle without context
+            print(f"[applier] ⚠ Pure addition without context, skipping")
+            return False, content
         
-        content = file_path.read_text(encoding="utf-8")
-        original_lines = content.splitlines()
+        file_lines = content.splitlines()
         
-        # Try to find the old code block
-        old_block = "\n".join(old_lines).strip()
-        new_block = "\n".join(new_lines).strip()
+        # Try to find the block of old_lines
+        old_normalized = [self._normalize(l) for l in old_lines]
         
-        if old_block in content:
-            # Direct replacement
-            new_content = content.replace(old_block, new_block)
-            file_path.write_text(new_content, encoding="utf-8")
-            return True
-        
-        # Try fuzzy matching with whitespace normalization
-        old_normalized = re.sub(r'\s+', ' ', old_block).strip()
-        
-        for i in range(len(original_lines)):
-            # Try to match starting from each line
-            end_idx = min(i + len(old_lines) + 5, len(original_lines))
-            candidate = "\n".join(original_lines[i:end_idx])
-            candidate_normalized = re.sub(r'\s+', ' ', candidate).strip()
+        for start_idx in range(len(file_lines) - len(old_lines) + 1):
+            match = True
+            for j, old_line in enumerate(old_normalized):
+                file_normalized = self._normalize(file_lines[start_idx + j])
+                if file_normalized != old_line:
+                    match = False
+                    break
             
-            if old_normalized in candidate_normalized:
-                # Found a match - replace
-                before = "\n".join(original_lines[:i])
-                after = "\n".join(original_lines[end_idx:])
-                new_content = before + "\n" + new_block + "\n" + after
-                file_path.write_text(new_content, encoding="utf-8")
-                return True
+            if match:
+                # Found it! Get the indentation from first matched line
+                original_line = file_lines[start_idx]
+                indent = len(original_line) - len(original_line.lstrip())
+                
+                # Apply indentation to new lines
+                indented_new = []
+                for new_line in new_lines:
+                    if new_line.strip():
+                        indented_new.append(" " * indent + new_line.strip())
+                    else:
+                        indented_new.append("")
+                
+                # Replace
+                result_lines = file_lines[:start_idx] + indented_new + file_lines[start_idx + len(old_lines):]
+                print(f"[applier] ✓ Replaced {len(old_lines)} line(s) at line {start_idx + 1}")
+                return True, "\n".join(result_lines)
         
-        print(f"[applier] Could not find old code block in {file_path}")
-        return False
-    
-    def _extract_file_path_from_function_ref(self, func_ref: str) -> Optional[str]:
-        """
-        Extract file path from function reference like 'src/file.ts:functionName'
-        Returns the file path part
-        """
-        if ":" in func_ref:
-            return func_ref.split(":")[0]
-        return None
-    
+        # Fallback: try matching just the first old line
+        if len(old_lines) == 1:
+            old_norm = old_normalized[0]
+            for i, file_line in enumerate(file_lines):
+                if self._normalize(file_line) == old_norm:
+                    indent = len(file_line) - len(file_line.lstrip())
+                    new_content = " " * indent + new_lines[0].strip() if new_lines else ""
+                    file_lines[i] = new_content
+                    print(f"[applier] ✓ Replaced single line at {i + 1}")
+                    return True, "\n".join(file_lines)
+        
+        print(f"[applier] ✗ Could not find: {old_lines[0][:50]}...")
+        return False, content
+
+
     def apply_fix(self) -> dict:
-        """
-        Apply the latest fix to the codebase
-        Returns a dict with success status and details
-        """
         fix_path, fix_data = self._get_latest_fix()
-        
         print(f"[applier] Using fix from: {fix_path}")
         
+        # Extract data from new format
         functions_to_edit = fix_data.get("functions_to_edit", [])
-        patch_suggestion = fix_data.get("patch_suggestion", "")
         reason = fix_data.get("reason", "")
+        raw_patch = fix_data.get("patch_suggestion", "")
         
         if not functions_to_edit:
-            return {
-                "success": False,
-                "error": "No functions_to_edit specified in fix"
-            }
+            return {"success": False, "error": "No functions_to_edit specified"}
         
-        if not patch_suggestion:
-            return {
-                "success": False,
-                "error": "No patch_suggestion provided in fix"
-            }
+        if not raw_patch:
+            return {"success": False, "error": "No patch_suggestion provided"}
         
-        print(f"[applier] Reason: {reason}")
-        print(f"[applier] Functions to edit: {functions_to_edit}")
-        
-        # Parse the patch
-        removed_lines, added_lines = self._parse_unified_diff(patch_suggestion)
-        
-        # Determine which file to edit
-        target_file = None
-        for func_ref in functions_to_edit:
-            file_path_str = self._extract_file_path_from_function_ref(func_ref)
-            if file_path_str:
-                target_file = Path(file_path_str)
-                if not target_file.is_absolute():
-                    target_file = (self.project_path / target_file).resolve()
-                break
-        
-        if not target_file:
-            return {
-                "success": False,
-                "error": f"Could not determine target file from: {functions_to_edit}"
-            }
-        
-        print(f"[applier] Target file: {target_file}")
-        
-        # Apply the fix
-        success = self._find_and_replace_in_file(target_file, removed_lines, added_lines)
-        
-        if success:
-            print(f"[applier] ✓ Successfully applied fix to {target_file}")
-            return {
-                "success": True,
-                "file": str(target_file),
-                "functions": functions_to_edit,
-                "reason": reason
-            }
+        # Parse file path from first function (format: "file.ts:funcName")
+        first_func = functions_to_edit[0]
+        if ":" in first_func:
+            file_path = first_func.rsplit(":", 1)[0]
         else:
-            return {
-                "success": False,
-                "error": f"Failed to apply fix to {target_file}"
-            }
+            file_path = first_func
+        
+        target_file = self._resolve_file_path(file_path)
+        print(f"[applier] Target file: {target_file}")
+        print(f"[applier] Reason: {reason}")
+        
+        if not target_file.exists():
+            return {"success": False, "error": f"File not found: {target_file}"}
+        
+        # Backup original
+        original_content = target_file.read_text(encoding="utf-8")
+        
+        # Parse and apply hunks
+        hunks = self._parse_patch(raw_patch)
+        print(f"[applier] Found {len(hunks)} change hunk(s)")
+        
+        content = original_content
+        applied_count = 0
+        
+        for i, (old_lines, new_lines) in enumerate(hunks):
+            print(f"[applier] Applying hunk {i+1}: -{len(old_lines)} +{len(new_lines)} lines")
+            success, content = self._find_and_replace(content, old_lines, new_lines)
+            if success:
+                applied_count += 1
+        
+        if applied_count == 0:
+            return {"success": False, "error": "Could not apply any hunks"}
+        
+        # Write changes
+        target_file.write_text(content, encoding="utf-8")
+        
+        # Validate syntax
+        # if not self._validate_syntax(target_file):
+        #     print(f"[applier] ✗ Syntax error after applying fix, reverting...")
+        #     target_file.write_text(original_content, encoding="utf-8")
+        #     return {"success": False, "error": "Applied fix created syntax error"}
+        
+        print(f"[applier] ✓ Successfully applied {applied_count}/{len(hunks)} hunk(s)")
+        return {
+            "success": True,
+            "file": str(target_file),
+            "function": functions_to_edit[0] if functions_to_edit else "",
+            "reason": reason,
+            "hunks_applied": applied_count
+        }
 
 
 if __name__ == "__main__":

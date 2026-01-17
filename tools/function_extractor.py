@@ -27,18 +27,25 @@ def extract_function_text(lines: list[str], func_name: str) -> str | None:
             start = i
             indent = len(line) - len(line.lstrip())
             break
+    
     if start is None:
         return None
 
-    buf = [lines[start]]
-    for nxt in lines[start+1:]:
-        cur_indent = len(nxt) - len(nxt.lstrip())
-        # stop when block closes (JS/TS '}' or dedent in Python)
-        if nxt.strip() and cur_indent <= indent and (nxt.strip().startswith("}") or nxt.lstrip() == nxt):
-            if nxt.strip().startswith("}"):
-                buf.append(nxt)
+    # ספירת סוגריים מסולסלים
+    brace_count = 0
+    started = False
+    buf = []
+    
+    for line in lines[start:]:
+        buf.append(line)
+        brace_count += line.count('{') - line.count('}')
+        
+        if brace_count > 0:
+            started = True
+        
+        if started and brace_count == 0:
             break
-        buf.append(nxt)
+    
     return "\n".join(buf).rstrip("\n")
 
 def main():

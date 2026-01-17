@@ -13,8 +13,12 @@ from pathlib import Path
 from typing import Dict, Any
 import time
 from dotenv import load_dotenv
+import re
 load_dotenv()
+from agents.ai_trace_agent import AiTraceAgent
 ROOT = Path(__file__).resolve().parents[1]
+trace_questions = 0
+MAX_TRACE_QUESTIONS = 3
 # ---- Gemini client ----
 try:
     import google.generativeai as genai
@@ -27,6 +31,13 @@ MODEL_NAME = "models/gemini-2.5-flash"
 
 CONTROLLER_PROMPT = """You are an autonomous debugging agent. You have ONLY a short human hint.
 You can ask the controller to run LOCAL TOOLS for you, and you will receive their outputs:
+
+CRITICAL RULES:
+- NEVER suggest fixes to files inside node_modules/ or any dependency folder
+- NEVER suggest fixes to third-party libraries
+- The bug is ALWAYS in the project's own code, not in dependencies
+- If the error originates from a dependency, find the PROJECT code that calls it incorrectly
+- Look for configuration files, test setup, or initialization code that might 
 
 Available tools you can request with an "action":
 1) "run_tree"
@@ -46,16 +57,25 @@ Available tools you can request with an "action":
    - params:
        "file_path": string (absolute or project-relative)
    - output label: "FILE::<path>"
-   
+4) "ask_trace_agent"
+   - description: ask the trace agent a question about the error logs. Use this when you need more details about the error that are not in the hint.
+   - WARNING: This tool is VERY expensive. Use it ONLY as a last resort when you cannot understand the error from the hint and other tools.
+   - params:
+       "question": string (your question about the logs)
+   - you can use this up to 3 times
+   - output label: "TRACE_ANSWER"
+
 Goal:
 - Propose a MINIMAL fix that changes as little logic as possible.
 - List which function(s) should be edited.
 - Provide a short reason.
-- Provide a concise patch suggestion in UNIFIED DIFF format:
+- Provide a MINIMAL patch with ONLY the lines that change:
   - removed lines start with "-"
   - added lines start with "+"
-  - do not include file headers like 'diff --git', '---', '+++'
-  - no code fences, only raw diff lines
+  - do NOT include context lines (unchanged lines)
+  - do NOT include file headers
+  - no code fences
+  - Example: if changing one line, return only 2 lines (one "-" and one "+")
 
 Loop:
 - If you need more context, return an action to run a tool with the correct params.
@@ -100,22 +120,22 @@ Additional rule:
 """
 
 class BugFixAgent:
-    def __init__(self, project_path: str):
-            self.project_path = Path(project_path).resolve()
-            if not self.project_path.is_dir():
-                raise ValueError(f"Invalid project path: {self.project_path}")
+    
+    def __init__(self, project_path: str, user_feedback: str = None):
+        self.project_path = Path(project_path).resolve()
+        self.user_feedback = user_feedback
 
-            # AI model
-            api_key = os.getenv("GEMINI_API_KEY")
-            if not api_key:
-                raise RuntimeError("Missing GEMINI_API_KEY")
-            genai.configure(api_key=api_key)
-            self.model = genai.GenerativeModel(MODEL_NAME)
+        # AI model
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            raise RuntimeError("Missing GEMINI_API_KEY")
+        genai.configure(api_key=api_key)
+        self.model = genai.GenerativeModel(MODEL_NAME)
 
-            self.workdir = ROOT
-            self.artifacts_dir = ROOT / "artifacts"
-            self.tool_outputs_dir = self.artifacts_dir / "tool_outputs"
-            self.tool_outputs_dir.mkdir(parents=True, exist_ok=True)
+        self.workdir = ROOT
+        self.artifacts_dir = ROOT / "artifacts"
+        self.tool_outputs_dir = self.artifacts_dir / "tool_outputs"
+        self.tool_outputs_dir.mkdir(parents=True, exist_ok=True)
     # ---------------------------
     # Static helpers
     # ---------------------------
@@ -180,7 +200,29 @@ class BugFixAgent:
             return self.read_file(out)
         except Exception as e:
             return f"[ERROR running file_reader.py] {e}"
+   
+    def _resolve_file_path(self, file_path: str) -> Path:
+        fpath = Path(file_path)
         
+        # אם נתיב מוחלט וקיים
+        if fpath.is_absolute() and fpath.exists():
+            return fpath
+        
+        # נסה נתיב יחסי ישיר
+        direct = (self.project_path / fpath).resolve()
+        if direct.exists():
+            return direct
+        
+        # חפש לפי שם קובץ + תיקיית אב
+        filename = fpath.name
+        parent = fpath.parent.name if fpath.parent.name else None
+        
+        for found in self.project_path.rglob(filename):
+            if parent is None or found.parent.name == parent:
+                return found
+        
+        return direct  # fallback
+    
     def run_function_extractor(self, file_path: Path, func_name: str) -> str:
         out = self.tool_outputs_dir / "bug_fix_agent_func.txt"
         print(f"[agent] running: function_extractor.py '{file_path}' '{func_name}'")
@@ -202,18 +244,30 @@ class BugFixAgent:
         latest_hint = self.get_latest_hint()
         hint_text = self.read_file(latest_hint)
 
+        if self.user_feedback:
+            hint_text += f"\n\n--- USER FEEDBACK ---\n{self.user_feedback}"
+        
         print(f"[bug-fix-agent] Using latest hint: {latest_hint}")
 
         tool_outputs: Dict[str, str] = {}
-        file_read_count = 0  # ← הוסף מונה
-        MAX_FILE_READS = 1   
+        read_files: set = set()
+        called_extracts: set = set()
 
         for step in range(1, 8):  # up to 7 steps
-            ctx_str = json.dumps(tool_outputs, ensure_ascii=False, indent=2)[:20000]
+            ctx_str = json.dumps(tool_outputs, ensure_ascii=False, separators=(',', ':'))[:20000]
+
             prompt = CONTROLLER_PROMPT.format(hint=hint_text[:20000], context=ctx_str)
 
             resp = self.model.generate_content(prompt)
-            txt = (resp.text or "").strip()
+            input_tokens = 0
+            if resp.usage_metadata:
+              input_tokens = int(resp.usage_metadata.prompt_token_count)
+              print(f"[agent] Step {step} - Tokens: input={resp.usage_metadata.prompt_token_count}, output={resp.usage_metadata.candidates_token_count}")
+            try:
+                txt = (resp.text or "").strip()
+            except ValueError:
+                print("[agent] Empty response from AI, retrying...")
+                continue
             if txt.startswith("```"):
                 # strip accidental fences
                 txt = txt.strip("`")
@@ -222,10 +276,36 @@ class BugFixAgent:
             try:
                 msg = json.loads(txt)
             except Exception as e:
-                print(f"[agent] AI returned non-JSON at step {step}: {e}", file=sys.stderr)
-                print(txt)
-                sys.exit(1)
-
+                print(f"[agent] AI returned non-JSON at step {step}", file=sys.stderr)
+                
+                # נסה לחלץ ג'ייסון מתוך הטקסט
+                json_match = re.search(r'\{[\s\S]*\}', txt)
+                if json_match:
+                    try:
+                        msg = json.loads(json_match.group())
+                        print(f"[agent] Extracted JSON from response")
+                    except:
+                        pass
+                    else:
+                        continue
+                
+                # אם לא הצלחנו - שמור את התשובה הטקסטואלית
+                fixes_dir = ROOT / "artifacts" / "bug_fixes"
+                fixes_dir.mkdir(exist_ok=True)
+                timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+                out_path = fixes_dir / f"fix_{timestamp}.json"
+                
+                out_path.write_text(
+                    json.dumps({
+                        "type": "analysis",
+                        "text": txt,
+                        "reason": "AI provided analysis instead of fix"
+                    }, ensure_ascii=False, indent=2),
+                    encoding="utf-8"
+                )
+                
+                print(f"[agent] Saved AI analysis to: {out_path}")
+                return input_tokens
             action = msg.get("action", "")
             # ---------------------------
             # FINAL OUTPUT
@@ -248,7 +328,7 @@ class BugFixAgent:
                 )
 
                 print(f"[agent] Bug fix written to: {out_path}")
-                return  out_path
+                return  input_tokens
             
             # ---------------------------
             # TOOL REQUESTS
@@ -259,30 +339,28 @@ class BugFixAgent:
                 continue
             
             if action == "run_tree":
-                tool_outputs["PROJECT_TREE"] = self.run_tree()[:200000]  # cap
+                tool_outputs["PROJECT_TREE"] = self.run_tree()[:20000]  # cap
                 continue
 
             if action == "read_file":
-                if file_read_count >= MAX_FILE_READS:
-                        print(f"[agent] ⚠ read_file limit reached ({MAX_FILE_READS}), skipping")
-                        tool_outputs["FILE_READ_LIMIT"] = "Limit reached. Use extract_function instead."
-                        continue
-
-                file_read_count += 1
                 params = msg.get("params") or {}
                 file_path = params.get("file_path")
-
+                
                 if not file_path:
                     print(f"[agent] Missing file_path for read_file at step {step}", file=sys.stderr)
                     sys.exit(1)
-
-                fpath = Path(file_path)
-                if not fpath.is_absolute():
-                    fpath = (self.project_path / fpath).resolve()
-
+                
+                fpath = self._resolve_file_path(file_path)
+                
+                if str(fpath) in read_files:
+                    print(f"[agent] ⚠ Already read {fpath.name}, skipping")
+                    tool_outputs["DUPLICATE_READ"] = f"Already read {fpath.name}"
+                    continue
+                
+                read_files.add(str(fpath))
                 content = self.run_file_reader(fpath)
                 key = f"FILE::{fpath}"
-                tool_outputs[key] = content[:200000]  # cap
+                tool_outputs[key] = content[:20000]
                 continue
 
             if action == "extract_function":
@@ -292,24 +370,103 @@ class BugFixAgent:
                 if not file_path or not func_name:
                     print(f"[agent] Missing params for extract_function at step {step}", file=sys.stderr)
                     sys.exit(1)
-                # resolve path relative to project if needed
-                fpath = Path(file_path)
-                if not fpath.is_absolute():
-                    fpath = (self.project_path / fpath).resolve()
-                out = self.run_function_extractor(fpath, func_name)
+                
+                fpath = self._resolve_file_path(file_path)
                 key = f"FUNCTION::{fpath}::{func_name}"
-                tool_outputs[key] = out[:100000]  # cap
+                
+                if key in called_extracts:
+                    print(f"[agent] Skipping duplicate call: {func_name}() from {fpath.name}")
+                    tool_outputs["DUPLICATE_CALL"] = f"Already retrieved {func_name} from {fpath.name}"
+                    continue
+                called_extracts.add(key)
+                
+                out = self.run_function_extractor(fpath, func_name)
+                tool_outputs[key] = out[:60000]
                 continue
-
+            if action == "ask_trace_agent":
+                if trace_questions >= MAX_TRACE_QUESTIONS:
+                    print(f"[agent] Trace questions limit reached ({MAX_TRACE_QUESTIONS})")
+                    tool_outputs["TRACE_LIMIT"] = "Question limit reached"
+                    continue
+                
+                params = msg.get("params") or {}
+                question = params.get("question")
+                
+                if not question:
+                    print(f"[agent] Missing question for ask_trace_agent at step {step}")
+                    continue
+                
+                trace_questions += 1
+                print(f"[agent] Asking trace agent: {question[:50]}...")
+                
+                trace_agent = AiTraceAgent()
+                answer, tokens = trace_agent.answer_question(question)
+                input_tokens += tokens
+                
+                tool_outputs["TRACE_ANSWER"] = answer[:5000]
+                continue
             # Unknown action
             print(f"[agent] Unknown action from AI: {action}", file=sys.stderr)
             print(json.dumps(msg, ensure_ascii=False, indent=2))
             sys.exit(1)
 
-        print("[agent] Reached max steps without final output.", file=sys.stderr)
-        sys.exit(1)
+        print("[agent] Reached max steps, requesting final answer...")
 
+        ctx_str = json.dumps(tool_outputs, ensure_ascii=False, separators=(',', ':'))[:20000]
+        final_prompt = f"""You have reached the maximum number of steps.
+        Based on all the context you gathered, provide your BEST GUESS for a fix.
+        If you cannot provide a fix, explain what information is missing and what the problem seems to be.
 
+        You MUST return a final JSON response now:
+        {{
+        "action": "final",
+        "result": {{
+            "functions_to_edit": ["file.ts:funcName"],
+            "reason": "your best explanation",
+            "patch_suggestion": "your best guess for the fix, or explanation of the problem"
+        }}
+        }}
+
+        --- HINT ---
+        {hint_text[:10000]}
+
+        --- CONTEXT ---
+        {ctx_str}
+        """
+
+        resp = self.model.generate_content(final_prompt)
+        if resp.usage_metadata:
+            input_tokens += int(resp.usage_metadata.prompt_token_count)
+
+        txt = (resp.text or "").strip()
+        if txt.startswith("```"):
+            txt = txt.strip("`")
+            if txt.lower().startswith("json"):
+                txt = txt[4:].strip()
+
+        try:
+            msg = json.loads(txt)
+            result = msg.get("result") or msg
+        except:
+            result = {
+                "functions_to_edit": [],
+                "reason": "Agent could not complete analysis",
+                "patch_suggestion": txt[:2000]
+            }
+
+        fixes_dir = ROOT / "artifacts" / "bug_fixes"
+        fixes_dir.mkdir(exist_ok=True)
+        timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+        out_path = fixes_dir / f"fix_{timestamp}.json"
+
+        out_path.write_text(
+            json.dumps(result, ensure_ascii=False, indent=2),
+            encoding="utf-8"
+        )
+
+        print(f"[agent] Final answer saved to: {out_path}")
+        return input_tokens
+                
 if __name__ == "__main__":
     if "--project" not in sys.argv:
         print("Usage: python bug_fix_agent.py --project /path/to/project")
